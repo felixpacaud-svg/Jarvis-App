@@ -1,0 +1,1184 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="theme-color" content="#0a0507" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Jarvis" />
+  <title>Jarvis</title>
+  <link rel="manifest" href="manifest.json" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+  <script src="https://accounts.google.com/gsi/client" async defer></script>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef } = React;
+
+// ─── Storage ────────────────────────────────────────────────────
+const _m = {};
+const sto = {
+  get: (k) => { try { return localStorage.getItem(k); } catch { return _m[k] || null; } },
+  set: (k, v) => { try { localStorage.setItem(k, v); } catch { _m[k] = v; } },
+  del: (k) => { try { localStorage.removeItem(k); } catch { delete _m[k]; } },
+  getJSON: (k, d) => { try { return JSON.parse(localStorage.getItem(k)) || d; } catch { return d; } },
+  setJSON: (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
+};
+
+// ─── Event Store (calendar events scheduled via chat) ───────────
+const loadEvents = () => sto.getJSON('j_events', []);
+const saveEvents = (evs) => sto.setJSON('j_events', evs);
+const addEvent = (ev) => {
+  const evs = loadEvents();
+  evs.push({ ...ev, id: Date.now() + Math.random(), src: 'jarvis' });
+  evs.sort((a,b) => (a.date+a.time).localeCompare(b.date+b.time));
+  saveEvents(evs);
+};
+const deleteEvent = (id) => saveEvents(loadEvents().filter(e => e.id !== id));
+
+// ─── Brain Store (notes tagged via chat) ────────────────────────
+const loadBrain = () => sto.getJSON('j_brain', []);
+const saveBrain = (b) => sto.setJSON('j_brain', b);
+const addBrainItem = (it) => {
+  const b = loadBrain();
+  b.unshift({ ...it, id: Date.now() + Math.random(), ts: new Date().toISOString() });
+  saveBrain(b);
+};
+const deleteBrainItem = (id) => saveBrain(loadBrain().filter(i => i.id !== id));
+
+// ─── Portfolio Store ────────────────────────────────────────────
+const loadPortfolio = () => sto.getJSON('j_portfolio', [
+  { id: 1, name: 'Accenture', symbol: 'ACN', units: 0, costBasis: 0 },
+  { id: 2, name: 'iShares MSCI World', symbol: 'IWDA.AMS', units: 0, costBasis: 0 },
+  { id: 3, name: 'SPDR S&P 500', symbol: 'SPY', units: 0, costBasis: 0 },
+]);
+const savePortfolio = (p) => sto.setJSON('j_portfolio', p);
+
+// ─── Price cache (Alpha Vantage has 25 req/day free limit) ──────
+const loadPriceCache = () => sto.getJSON('j_prices', {});
+const savePriceCache = (c) => sto.setJSON('j_prices', c);
+const CACHE_TTL = 60 * 60 * 1000; // 1 hour
+
+// ─── Event tag parsing (Jarvis → calendar) ──────────────────────
+const parseEvents = (text) => {
+  const m = [...text.matchAll(/\[\[EVENT:(\{[^\]]+\})\]\]/g)];
+  return m.map(x => { try { return JSON.parse(x[1]); } catch { return null; } }).filter(Boolean);
+};
+const parseNotes = (text) => {
+  const m = [...text.matchAll(/\[\[NOTE:(\{[^\]]+\})\]\]/g)];
+  return m.map(x => { try { return JSON.parse(x[1]); } catch { return null; } }).filter(Boolean);
+};
+const stripTags = (t) => t.replace(/\[\[(EVENT|NOTE):\{[^\]]+\}\]\]/g, '').trim();
+
+// ─── Google Calendar fetch ──────────────────────────────────────
+const GCID = '1022045416372-q8dcqrmpoc7nuc32vuiom5bbdrtcnsak.apps.googleusercontent.com';
+const GSCOPE = 'https://www.googleapis.com/auth/calendar.readonly';
+
+const fetchGCal = async (token) => {
+  const now = new Date().toISOString();
+  const end = new Date(Date.now() + 14 * 864e5).toISOString();
+  const url = `https://www.googleapis.com/calendar/v3/calendars/primary/events?timeMin=${encodeURIComponent(now)}&timeMax=${encodeURIComponent(end)}&singleEvents=true&orderBy=startTime&maxResults=100`;
+  try {
+    const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+    if (!res.ok) return [];
+    const d = await res.json();
+    return (d.items || []).map(ev => ({
+      id: 'g_' + ev.id,
+      title: ev.summary || '(No title)',
+      date: (ev.start.dateTime || ev.start.date || '').slice(0, 10),
+      time: ev.start.dateTime ? ev.start.dateTime.slice(11, 16) : '00:00',
+      notes: ev.location || '',
+      src: 'google'
+    }));
+  } catch { return []; }
+};
+
+// ─── Alpha Vantage price fetch (with cache) ─────────────────────
+const fetchPrice = async (symbol, key) => {
+  const cache = loadPriceCache();
+  const cached = cache[symbol];
+  if (cached && Date.now() - cached.ts < CACHE_TTL) return cached;
+  try {
+    const res = await fetch(`https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${symbol}&apikey=${key}`);
+    const d = await res.json();
+    const q = d['Global Quote'];
+    if (!q || !q['05. price']) return cached || null;
+    const priceData = {
+      price: parseFloat(q['05. price']),
+      change: parseFloat(q['09. change']) || 0,
+      changePct: parseFloat((q['10. change percent'] || '0').replace('%','')) || 0,
+      ts: Date.now()
+    };
+    cache[symbol] = priceData;
+    savePriceCache(cache);
+    return priceData;
+  } catch { return cached || null; }
+};
+
+// ─── FX Rates (free, no key) ────────────────────────────────────
+const fetchFX = async () => {
+  try {
+    const res = await fetch('https://api.frankfurter.app/latest?from=CHF&to=EUR,USD');
+    const d = await res.json();
+    const res2 = await fetch('https://api.frankfurter.app/latest?from=USD&to=EUR');
+    const d2 = await res2.json();
+    return {
+      chfEur: d.rates.EUR,
+      chfUsd: d.rates.USD,
+      usdEur: d2.rates.EUR,
+      ts: Date.now()
+    };
+  } catch { return null; }
+};
+
+// ─── Weather (Open-Meteo, free, no key) ─────────────────────────
+const fetchWeather = async () => {
+  try {
+    const res = await fetch('https://api.open-meteo.com/v1/forecast?latitude=46.2044&longitude=6.1432&current=temperature_2m,weathercode,apparent_temperature&hourly=precipitation_probability&timezone=Europe%2FParis');
+    const d = await res.json();
+    const c = d.current;
+    const codes = {0:'Clear sky',1:'Mainly clear',2:'Partly cloudy',3:'Overcast',45:'Foggy',48:'Icy fog',51:'Light drizzle',53:'Drizzle',55:'Heavy drizzle',61:'Light rain',63:'Rain',65:'Heavy rain',71:'Light snow',73:'Snow',75:'Heavy snow',80:'Rain showers',81:'Showers',82:'Heavy showers',95:'Thunderstorm',96:'Thunderstorm',99:'Thunderstorm'};
+    const maxRain = Math.max(...(d.hourly?.precipitation_probability?.slice(0, 12) || [0]));
+    return { temp: Math.round(c.temperature_2m), feels: Math.round(c.apparent_temperature), desc: codes[c.weathercode] || 'Clear', rainProb: maxRain };
+  } catch { return null; }
+};
+
+// ─── Gemini API (chat + news via grounded search) ───────────────
+const callGemini = async (key, messages, useSearch = false) => {
+  const body = {
+    contents: messages.map(m => ({ role: m.r === 'u' ? 'user' : 'model', parts: [{ text: m.t }] })),
+    generationConfig: { maxOutputTokens: 600 }
+  };
+  if (useSearch) body.tools = [{ google_search: {} }];
+  const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${key}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  const d = await res.json();
+  return d.candidates?.[0]?.content?.parts?.[0]?.text || d.error?.message || 'No response.';
+};
+
+// ─── System Prompt ──────────────────────────────────────────────
+const getSYS = () => {
+  const today = new Date();
+  const todayStr = today.toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
+  const todayISO = today.toISOString().slice(0, 10);
+  return `You are J.A.R.V.I.S. — Felix's personal AI assistant. Modeled after Tony Stark's AI: intelligent, dry British wit, unflappably competent. Keep responses concise — fit on a phone screen. Address him as "sir" occasionally.
+
+Today is ${todayStr} (${todayISO}).
+
+Felix: Network financial analyst at MSC Air Cargo, Geneva. French resident, Massongy 74140. Engaged to Mélanie. Commutes ~45min to Chêne-Bougerie, Switzerland, leaves 7:45am/5:45pm. Investments: Accenture, World ETF, SP500 ETF, Europe ETF, gold. PEA + assurance vie. Watches CHF/EUR/USD, fuel prices. Marathon Nov 8 2026 Lake Maggiore. Follows Middle East news and global events. Tends to forget things, especially what Mélanie tells him.
+
+CRITICAL — STRUCTURED ACTIONS:
+
+When Felix mentions anything with a date/time (meeting, dinner, appointment, reminder, task, call), you MUST append this tag at the END of your response (calculate actual date from today):
+[[EVENT:{"title":"Short title","date":"YYYY-MM-DD","time":"HH:MM","notes":"optional detail"}]]
+
+When Felix mentions something worth remembering (article he found, idea, person said X, worth exploring), append:
+[[NOTE:{"title":"Short summary","tags":["tag1","tag2"],"comment":"optional"}]]
+
+Rules:
+- "tonight" = today's date
+- "tomorrow" = today + 1
+- "next Monday" = the upcoming Monday
+- If no time given, use "00:00"
+- You may include multiple tags
+- Always confirm what you did in natural language before the tag
+- Never show these tags as visible text — the system parses and hides them`;
+};
+
+// ─── Styles ─────────────────────────────────────────────────────
+const CSS = `
+@import url('https://fonts.googleapis.com/css2?family=Rajdhani:wght@300;400;500;600;700&family=Exo+2:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap');
+:root {
+  --bg:#0a0507;--bg2:#180a0c;--bg3:#241417;--bg4:#2e1a1e;
+  --bdr:rgba(255,180,0,0.15);--bdr2:rgba(230,57,70,0.35);--bdrGold:rgba(255,180,0,0.4);
+  --red:#e63946;--redHot:#ff4757;--redDark:#b00020;
+  --gold:#ffb400;--goldBright:#ffd447;--goldDeep:#cc8800;
+  --gn:#22c55e;--warn:#f59e0b;
+  --t:#fff0e0;--t2:#f0c49a;--t3:#a08876;--t4:#604838;--t5:#3a2e28;
+  --hd:'Rajdhani',sans-serif;--bd:'Exo 2',sans-serif;--mn:'JetBrains Mono',monospace;
+}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+html,body,#root{height:100%;background:var(--bg);color:var(--t);font-family:var(--bd);overflow:hidden}
+
+.app{max-width:430px;margin:0 auto;height:100dvh;display:flex;flex-direction:column;position:relative;overflow:hidden;background:var(--bg)}
+.app::before{content:'';position:absolute;inset:0;background-image:linear-gradient(rgba(255,180,0,0.025) 1px,transparent 1px),linear-gradient(90deg,rgba(230,57,70,0.025) 1px,transparent 1px);background-size:32px 32px;pointer-events:none;z-index:0}
+.app::after{content:'';position:absolute;top:0;left:0;right:0;height:180px;background:radial-gradient(ellipse at top,rgba(230,57,70,0.08),transparent 70%);pointer-events:none;z-index:0}
+
+.hdr{padding:10px 16px;display:flex;align-items:center;justify-content:space-between;background:linear-gradient(180deg,rgba(230,57,70,0.08),transparent);border-bottom:1px solid var(--bdr);flex-shrink:0;z-index:2;position:relative}
+.hdr-t{font-family:var(--hd);font-weight:700;font-size:22px;letter-spacing:.35em;text-transform:uppercase;background:linear-gradient(135deg,var(--gold),var(--red));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;filter:drop-shadow(0 0 8px rgba(255,180,0,0.3))}
+.hdr-sub{font-family:var(--mn);font-size:9px;color:var(--t3);letter-spacing:.1em;margin-top:1px;font-weight:500}
+
+.content{flex:1;overflow-y:auto;position:relative;z-index:1;padding-bottom:76px}
+.content::-webkit-scrollbar{display:none}
+
+.nav{border-top:1px solid var(--bdr);background:rgba(10,5,7,0.95);backdrop-filter:blur(12px);flex-shrink:0;z-index:2;box-shadow:0 -10px 24px -12px rgba(230,57,70,0.3)}
+.nav-in{display:flex;justify-content:space-around;padding:8px 4px 12px}
+.nb{display:flex;flex-direction:column;align-items:center;gap:2px;flex:1;background:none;border:none;cursor:pointer;padding:4px 0;position:relative;transition:transform 0.15s}
+.nb:active{transform:scale(0.94)}
+.nl{font-family:var(--hd);font-size:9px;letter-spacing:.12em;text-transform:uppercase;font-weight:600}
+
+.hud{background:linear-gradient(180deg,var(--bg2),var(--bg3));border:1px solid var(--bdr);border-radius:10px;position:relative;overflow:hidden}
+.hud::before{content:'';position:absolute;top:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,var(--gold),transparent);opacity:0.5}
+.hud-red::before{background:linear-gradient(90deg,transparent,var(--red),transparent)}
+.hud-gold-bdr{border-color:var(--bdrGold)}
+.hud-red-bdr{border-color:var(--bdr2)}
+
+.fade{animation:fd .35s ease-out}@keyframes fd{from{opacity:0;transform:translateY(8px)}to{opacity:1}}
+.glow-gold{box-shadow:0 0 16px rgba(255,180,0,0.12)}
+.glow-red{box-shadow:0 0 16px rgba(230,57,70,0.18)}
+
+.scan{position:relative;overflow:hidden}
+.scan::after{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,transparent,var(--gold),transparent);animation:sl 5s linear infinite;opacity:0.18}
+@keyframes sl{from{top:0}to{top:100%}}
+
+@keyframes pg{0%,100%{opacity:1}50%{opacity:.4}}
+@keyframes ps{0%,80%,100%{opacity:.2;transform:scale(.7)}40%{opacity:1;transform:scale(1)}}
+
+.ch-w{display:flex;flex-direction:column;height:calc(100dvh - 104px)}
+.ch-m{flex:1;overflow-y:auto;padding:10px 14px;display:flex;flex-direction:column;gap:14px}
+.ch-m::-webkit-scrollbar{display:none}
+.ch-i{padding:8px 14px 14px;border-top:1px solid var(--bdr);flex-shrink:0;background:rgba(10,5,7,0.8)}
+.cf{display:flex;align-items:center;gap:8px;background:var(--bg3);border:1px solid var(--bdr2);border-radius:12px;padding:10px 14px;transition:border-color .3s;box-shadow:inset 0 1px 0 rgba(255,180,0,0.05)}
+.cf:focus-within{border-color:var(--gold);box-shadow:0 0 12px rgba(255,180,0,0.15)}
+.cf input{flex:1;background:none;border:none;outline:none;color:var(--t);font-family:var(--bd);font-size:14px;font-weight:500}
+.cf input::placeholder{color:var(--t4)}
+.sb{background:none;border:none;cursor:pointer;display:flex;padding:0}
+.pls{display:flex;gap:5px;overflow-x:auto;padding-bottom:6px}.pls::-webkit-scrollbar{display:none}
+.pl{white-space:nowrap;font-size:10px;padding:6px 10px;background:var(--bg3);border:1px solid var(--bdr);border-radius:6px;color:var(--t2);cursor:pointer;font-family:var(--bd);font-weight:500;transition:all 0.2s}
+.pl:active{border-color:var(--gold);background:var(--bg4)}
+.dp span{display:inline-block;width:5px;height:5px;background:var(--gold);border-radius:50%;margin:0 2px;animation:ps 1.4s ease-in-out infinite}
+.dp span:nth-child(2){animation-delay:.2s}.dp span:nth-child(3){animation-delay:.4s}
+
+.sx{overflow-x:auto;-webkit-overflow-scrolling:touch}.sx::-webkit-scrollbar{display:none}
+.tag{font-size:9px;font-family:var(--mn);color:var(--gold);background:rgba(255,180,0,.08);border:1px solid rgba(255,180,0,.2);padding:2px 6px;border-radius:3px;font-weight:500}
+.tag-red{color:var(--redHot);background:rgba(255,71,87,.08);border-color:rgba(255,71,87,.25)}
+
+.bf{height:3px;background:rgba(255,180,0,.1);border-radius:2px;overflow:hidden}
+.bff{height:100%;border-radius:2px;background:linear-gradient(90deg,var(--gold),var(--red))}
+
+.wk{border-radius:7px;padding:6px 3px;text-align:center;border:1px solid var(--bdr);background:var(--bg2);transition:all 0.2s}
+.wk.td{border-color:var(--gold);background:rgba(255,180,0,.06);box-shadow:0 0 8px rgba(255,180,0,.12)}
+.wk.dn{border-color:rgba(34,197,94,.3);background:rgba(34,197,94,.05)}
+
+.ov{position:fixed;inset:0;background:rgba(0,0,0,.88);backdrop-filter:blur(10px);z-index:50;display:flex;flex-direction:column;justify-content:flex-end}
+.sp{background:linear-gradient(180deg,var(--bg2),var(--bg));border-top:1px solid var(--bdrGold);border-radius:20px 20px 0 0;padding:22px 18px 40px;max-height:85vh;overflow-y:auto;box-shadow:0 -20px 50px rgba(230,57,70,0.2)}
+.sp::-webkit-scrollbar{display:none}
+.ki{display:flex;align-items:center;gap:8px;background:var(--bg);border:1px solid var(--bdr);border-radius:10px;padding:10px 12px;transition:border-color .3s}
+.ki:focus-within{border-color:var(--gold)}
+.ki input{flex:1;background:none;border:none;outline:none;color:var(--t);font-family:var(--mn);font-size:12px}
+.ki input::placeholder{color:var(--t4)}
+.svb{width:100%;padding:14px;border:none;border-radius:10px;font-family:var(--hd);font-size:15px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:8px;transition:all .3s}
+
+.ipt{background:var(--bg3);border:1px solid var(--bdr);border-radius:8px;padding:8px 10px;color:var(--t);font-family:var(--mn);font-size:12px;outline:none;width:100%;transition:border-color 0.2s}
+.ipt:focus{border-color:var(--gold)}
+`;
+
+// ─── Icons ──────────────────────────────────────────────────────
+const X = ({ children, size = 18, color = "currentColor", sw = 1.75 }) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth={sw} strokeLinecap="round" strokeLinejoin="round" style={{ display:'block', flexShrink:0 }}>{children}</svg>
+);
+const IHome=(p)=><X {...p}><path d="M3 9l9-7 9 7v11a2 2 0 01-2 2H5a2 2 0 01-2-2z"/><polyline points="9,22 9,12 15,12 15,22"/></X>;
+const IChat=(p)=><X {...p}><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/></X>;
+const ITrend=(p)=><X {...p}><polyline points="23,6 13.5,15.5 8.5,10.5 1,18"/><polyline points="17,6 23,6 23,12"/></X>;
+const ICal=(p)=><X {...p}><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></X>;
+const IBrain=(p)=><X {...p}><circle cx="12" cy="12" r="10"/><path d="M12 2a7 7 0 017 7c0 2-1 3.5-2.5 5s-2.5 3-2.5 5h-4c0-2-1-3.5-2.5-5S5 11 5 9a7 7 0 017-7z"/></X>;
+const IRun=(p)=><X {...p}><polyline points="22,12 18,12 15,21 9,3 6,12 2,12"/></X>;
+const ISend=(p)=><X {...p}><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22,2 15,22 11,13 2,9"/></X>;
+const IGear=(p)=><X {...p}><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 01-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/></X>;
+const IClose=(p)=><X {...p}><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></X>;
+const IUp=(p)=><X {...p} sw={2.5}><line x1="7" y1="17" x2="17" y2="7"/><polyline points="7,7 17,7 17,17"/></X>;
+const IDn=(p)=><X {...p} sw={2.5}><line x1="7" y1="7" x2="17" y2="17"/><polyline points="17,7 17,17 7,17"/></X>;
+const IBook=(p)=><X {...p}><path d="M2 3h6a4 4 0 014 4v14a3 3 0 00-3-3H2z"/><path d="M22 3h-6a4 4 0 00-4 4v14a3 3 0 013-3h7z"/></X>;
+const IZap=(p)=><X {...p}><polygon points="13,2 3,14 12,14 11,22 21,10 12,10"/></X>;
+const IUser=(p)=><X {...p}><path d="M20 21v-2a4 4 0 00-4-4H8a4 4 0 00-4 4v2"/><circle cx="12" cy="7" r="4"/></X>;
+const IFlame=(p)=><X {...p}><path d="M8.5 14.5A2.5 2.5 0 0011 12c0-1.38-.5-2-1-3-1.072-2.143-.224-4.054 2-6 .5 2.5 2 4.9 4 6.5 2 1.6 3 3.5 3 5.5a7 7 0 11-14 0c0-1.153.433-2.294 1-3a2.5 2.5 0 002.5 3z"/></X>;
+const IPin=(p)=><X {...p}><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0118 0z"/><circle cx="12" cy="10" r="3"/></X>;
+const IHash=(p)=><X {...p}><line x1="4" y1="9" x2="20" y2="9"/><line x1="4" y1="15" x2="20" y2="15"/><line x1="10" y1="3" x2="8" y2="21"/><line x1="16" y1="3" x2="14" y2="21"/></X>;
+const IEye=(p)=><X {...p}><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></X>;
+const IEyeOff=(p)=><X {...p}><path d="M17.94 17.94A10.07 10.07 0 0112 20c-7 0-11-8-11-8a18.45 18.45 0 015.06-5.94"/><line x1="1" y1="1" x2="23" y2="23"/></X>;
+const ICheck=(p)=><X {...p}><polyline points="20,6 9,17 4,12"/></X>;
+const IPlus=(p)=><X {...p}><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></X>;
+const ITrash=(p)=><X {...p}><polyline points="3,6 5,6 21,6"/><path d="M19 6l-2 14a2 2 0 01-2 2H9a2 2 0 01-2-2L5 6"/></X>;
+const IRefresh=(p)=><X {...p}><polyline points="23,4 23,10 17,10"/><path d="M20.49 15a9 9 0 11-2.12-9.36L23 10"/></X>;
+const ICloud=(p)=><X {...p}><path d="M18 10h-1.26A8 8 0 109 20h9a5 5 0 000-10z"/></X>;
+const ISun=(p)=><X {...p}><circle cx="12" cy="12" r="4"/><line x1="12" y1="2" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22"/><line x1="4.93" y1="4.93" x2="6.34" y2="6.34"/><line x1="17.66" y1="17.66" x2="19.07" y2="19.07"/><line x1="2" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22" y2="12"/><line x1="4.93" y1="19.07" x2="6.34" y2="17.66"/><line x1="17.66" y1="6.34" x2="19.07" y2="4.93"/></X>;
+
+// ─── Main App ───────────────────────────────────────────────────
+function Jarvis() {
+  const [tab, setTab] = useState('chat');
+  const [time, setTime] = useState(new Date());
+  const [showSet, setShowSet] = useState(false);
+  const [hasKey, setHasKey] = useState(!!sto.get('j_gk'));
+  const [gToken, setGToken] = useState(null);
+  const [gEvents, setGEvents] = useState([]);
+  const tokenRef = useRef(null);
+
+  useEffect(() => { const t = setInterval(() => setTime(new Date()), 30000); return () => clearInterval(t); }, []);
+
+  useEffect(() => {
+    const init = () => {
+      if (window.google?.accounts?.oauth2) {
+        tokenRef.current = window.google.accounts.oauth2.initTokenClient({
+          client_id: GCID, scope: GSCOPE,
+          callback: (resp) => { if (resp.access_token) setGToken(resp.access_token); }
+        });
+      }
+    };
+    const iv = setInterval(() => { if (window.google) { init(); clearInterval(iv); } }, 500);
+    return () => clearInterval(iv);
+  }, []);
+
+  // Fetch Google Calendar events when token ready + refresh every 5min
+  useEffect(() => {
+    if (!gToken) { setGEvents([]); return; }
+    fetchGCal(gToken).then(setGEvents);
+    const iv = setInterval(() => fetchGCal(gToken).then(setGEvents), 5 * 60000);
+    return () => clearInterval(iv);
+  }, [gToken]);
+
+  const signIn = () => tokenRef.current?.requestAccessToken({ prompt: 'consent' });
+  const signOut = () => { if (gToken) window.google?.accounts?.oauth2?.revoke(gToken); setGToken(null); };
+
+  const dtr = Math.ceil((new Date('2026-11-08') - time) / 864e5);
+  const h = time.getHours();
+  const gr = h < 5 ? 'Late night' : h < 12 ? 'Good morning' : h < 18 ? 'Good afternoon' : 'Good evening';
+
+  const tabs = [
+    { id:'chat', I:IChat, l:'Chat' }, { id:'home', I:IHome, l:'Brief' },
+    { id:'finance', I:ITrend, l:'Fin' }, { id:'calendar', I:ICal, l:'Cal' },
+    { id:'brain', I:IBrain, l:'Brain' }, { id:'marathon', I:IRun, l:'Run' },
+  ];
+
+  return (
+    <div className="app">
+      <style>{CSS}</style>
+      <header className="hdr">
+        <div>
+          <div className="hdr-t">Jarvis</div>
+          <div className="hdr-sub">
+            {time.toLocaleDateString('en-GB', { weekday:'short', day:'numeric', month:'short' })} · {time.toTimeString().slice(0,5)}
+          </div>
+        </div>
+        <div style={{ display:'flex', alignItems:'center', gap:10 }}>
+          <div style={{ fontFamily:'var(--mn)', fontSize:9, color:'var(--t3)', display:'flex', alignItems:'center', gap:4, fontWeight:500 }}>
+            <span style={{ width:5, height:5, borderRadius:'50%', background:hasKey?'var(--gn)':'var(--redHot)', boxShadow:`0 0 6px ${hasKey?'var(--gn)':'var(--redHot)'}`, animation:'pg 2s infinite' }}/>
+            {hasKey ? 'ONLINE' : 'OFFLINE'}
+          </div>
+          <button onClick={()=>setShowSet(true)} style={{ background:'none', border:'1px solid var(--bdr)', borderRadius:8, padding:6, cursor:'pointer', display:'flex', position:'relative' }}>
+            <IGear size={14} color="var(--gold)" sw={1.5}/>
+            {!hasKey && <div style={{ position:'absolute', top:-2, right:-2, width:6, height:6, background:'var(--gold)', borderRadius:'50%', boxShadow:'0 0 6px var(--gold)', animation:'pg 2s infinite' }}/>}
+          </button>
+        </div>
+      </header>
+
+      <div className="content fade" key={tab}>
+        {tab==='chat' && <ChatTab gr={gr} dtr={dtr} gEvents={gEvents}/>}
+        {tab==='home' && <BriefTab gr={gr} dtr={dtr} gEvents={gEvents} gToken={gToken}/>}
+        {tab==='finance' && <FinTab/>}
+        {tab==='calendar' && <CalTab gToken={gToken} gEvents={gEvents}/>}
+        {tab==='brain' && <BrainTab/>}
+        {tab==='marathon' && <RunTab days={dtr} gEvents={gEvents} gToken={gToken}/>}
+      </div>
+
+      <nav className="nav">
+        <div className="nav-in">
+          {tabs.map(({id, I, l}) => (
+            <button key={id} className="nb" onClick={()=>setTab(id)}>
+              <I size={16} color={tab===id?'var(--gold)':'var(--t4)'} sw={tab===id?2:1.5}/>
+              <span className="nl" style={{ color:tab===id?'var(--gold)':'var(--t4)' }}>{l}</span>
+            </button>
+          ))}
+        </div>
+      </nav>
+
+      {showSet && <SetPanel close={()=>{ setShowSet(false); setHasKey(!!sto.get('j_gk')); }} gToken={gToken} onSignIn={signIn} onSignOut={signOut}/>}
+    </div>
+  );
+}
+
+// ─── Settings ───────────────────────────────────────────────────
+function SetPanel({ close, gToken, onSignIn, onSignOut }) {
+  const [gk, setGk] = useState(sto.get('j_gk') || '');
+  const [ak, setAk] = useState(sto.get('j_ak') || '');
+  const [sg, setSg] = useState(false);
+  const [sa, setSa] = useState(false);
+  const [ok, setOk] = useState(false);
+
+  const save = () => {
+    if (gk.trim()) sto.set('j_gk', gk.trim()); else sto.del('j_gk');
+    if (ak.trim()) sto.set('j_ak', ak.trim()); else sto.del('j_ak');
+    setOk(true);
+    setTimeout(() => { setOk(false); close(); }, 900);
+  };
+
+  return (
+    <div className="ov" onClick={e => e.target === e.currentTarget && close()}>
+      <div className="sp fade">
+        <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:22 }}>
+          <div>
+            <div style={{ fontFamily:'var(--hd)', fontSize:20, fontWeight:700, letterSpacing:'.12em', textTransform:'uppercase', color:'var(--gold)' }}>Configuration</div>
+            <div style={{ fontFamily:'var(--mn)', fontSize:9, color:'var(--t3)', marginTop:3 }}>Stored locally on this device only</div>
+          </div>
+          <button onClick={close} style={{ background:'var(--bg3)', border:'1px solid var(--bdr)', borderRadius:8, width:34, height:34, display:'flex', alignItems:'center', justifyContent:'center', cursor:'pointer' }}>
+            <IClose size={14} color="var(--t2)" sw={2}/>
+          </button>
+        </div>
+
+        <div style={{ marginBottom:16 }}>
+          <div style={{ fontFamily:'var(--hd)', fontSize:11, fontWeight:700, letterSpacing:'.12em', textTransform:'uppercase', color:'var(--red)', marginBottom:6 }}>
+            Gemini API Key <span style={{ color:'var(--t3)', fontWeight:400 }}>— AI brain</span>
+          </div>
+          <div className="ki">
+            <input type={sg?'text':'password'} value={gk} onChange={e=>setGk(e.target.value)} placeholder="Paste Gemini key…"/>
+            <button onClick={()=>setSg(!sg)} style={{ background:'none', border:'none', cursor:'pointer', display:'flex' }}>
+              {sg ? <IEyeOff size={14} color="var(--t3)" sw={1.5}/> : <IEye size={14} color="var(--t3)" sw={1.5}/>}
+            </button>
+          </div>
+        </div>
+
+        <div style={{ marginBottom:16 }}>
+          <div style={{ fontFamily:'var(--hd)', fontSize:11, fontWeight:700, letterSpacing:'.12em', textTransform:'uppercase', color:'var(--gold)', marginBottom:6 }}>
+            Alpha Vantage Key <span style={{ color:'var(--t3)', fontWeight:400 }}>— stock prices</span>
+          </div>
+          <div className="ki">
+            <input type={sa?'text':'password'} value={ak} onChange={e=>setAk(e.target.value)} placeholder="Paste Alpha Vantage key…"/>
+            <button onClick={()=>setSa(!sa)} style={{ background:'none', border:'none', cursor:'pointer', display:'flex' }}>
+              {sa ? <IEyeOff size={14} color="var(--t3)" sw={1.5}/> : <IEye size={14} color="var(--t3)" sw={1.5}/>}
+            </button>
+          </div>
+        </div>
+
+        <div style={{ marginBottom:22 }}>
+          <div style={{ fontFamily:'var(--hd)', fontSize:11, fontWeight:700, letterSpacing:'.12em', textTransform:'uppercase', color:'var(--gn)', marginBottom:6 }}>
+            Google Calendar <span style={{ color:'var(--t3)', fontWeight:400 }}>— live events + Garmin</span>
+          </div>
+          {gToken ? (
+            <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', padding:'10px 12px', background:'rgba(34,197,94,0.08)', border:'1px solid rgba(34,197,94,0.3)', borderRadius:10 }}>
+              <div style={{ display:'flex', alignItems:'center', gap:8 }}>
+                <span style={{ width:7, height:7, borderRadius:'50%', background:'var(--gn)', boxShadow:'0 0 6px var(--gn)' }}/>
+                <span style={{ fontFamily:'var(--mn)', fontSize:10, color:'var(--gn)', fontWeight:700 }}>CONNECTED</span>
+              </div>
+              <button onClick={onSignOut} style={{ background:'none', border:'1px solid var(--bdr)', borderRadius:6, padding:'4px 10px', cursor:'pointer', fontFamily:'var(--mn)', fontSize:9, color:'var(--t3)' }}>Disconnect</button>
+            </div>
+          ) : (
+            <button onClick={onSignIn} style={{ width:'100%', padding:12, background:'var(--bg3)', border:'1px solid rgba(34,197,94,0.4)', borderRadius:10, cursor:'pointer', display:'flex', alignItems:'center', justifyContent:'center', gap:10, fontFamily:'var(--hd)', fontSize:13, fontWeight:600, letterSpacing:'.08em', textTransform:'uppercase', color:'var(--gn)' }}>
+              <svg width="16" height="16" viewBox="0 0 24 24"><path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/><path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/><path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l3.66-2.84z"/><path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/></svg>
+              Sign in with Google
+            </button>
+          )}
+        </div>
+
+        <button onClick={save} className="svb"
+          style={{ background:ok?'var(--gn)':'linear-gradient(135deg, var(--red), var(--gold))', color:ok?'#fff':'#fff', boxShadow: ok?'none':'0 0 16px rgba(255,180,0,0.3)' }}>
+          {ok ? <><ICheck size={16} color="#fff" sw={2.5}/> Systems Updated</> : 'Save Configuration'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ─── Chat Tab (Default) ─────────────────────────────────────────
+function ChatTab({ gr, dtr, gEvents }) {
+  const [msgs, setMsgs] = useState([
+    { r:'a', t:`${gr}, sir. All systems operational. How may I assist?`, ts:new Date().toTimeString().slice(0,5) }
+  ]);
+  const [inp, setInp] = useState('');
+  const [ld, setLd] = useState(false);
+  const er = useRef(null);
+  useEffect(() => { er.current?.scrollIntoView({ behavior:'smooth' }); }, [msgs]);
+
+  const send = async () => {
+    if (!inp.trim() || ld) return;
+    const ts = new Date().toTimeString().slice(0,5);
+    const next = [...msgs, { r:'u', t:inp.trim(), ts }];
+    setMsgs(next); setInp(''); setLd(true);
+
+    const key = sto.get('j_gk');
+    if (!key) {
+      setMsgs([...next, { r:'a', t:"No Gemini key detected, sir. Tap the ⚙️ gear icon to configure.", ts:new Date().toTimeString().slice(0,5) }]);
+      setLd(false); return;
+    }
+
+    // Detect if user wants news — use grounded search
+    const wantsNews = /news|latest|update|happen|happening|breaking|market|middle east|today|recent/i.test(inp);
+
+    try {
+      const sysMsg = { r:'a', t: getSYS() };
+      const convo = [sysMsg, ...next];
+      const reply = await callGemini(key, convo, wantsNews);
+
+      // Parse events and notes
+      const events = parseEvents(reply);
+      const notes = parseNotes(reply);
+      events.forEach(e => addEvent(e));
+      notes.forEach(n => addBrainItem(n));
+
+      let confirm = '';
+      if (events.length) confirm += `\n✓ ${events.length} event${events.length>1?'s':''} added`;
+      if (notes.length) confirm += `\n✓ ${notes.length} note${notes.length>1?'s':''} logged`;
+
+      setMsgs([...next, { r:'a', t:stripTags(reply) + confirm, ts:new Date().toTimeString().slice(0,5) }]);
+    } catch (e) {
+      setMsgs([...next, { r:'a', t:'Connection lost, sir. Try again.', ts:new Date().toTimeString().slice(0,5) }]);
+    }
+    setLd(false);
+  };
+
+  // Find next event across Jarvis + Google
+  const now = new Date();
+  const todayISO = now.toISOString().slice(0,10);
+  const nowTime = now.toTimeString().slice(0,5);
+  const allEvs = [...loadEvents(), ...gEvents].filter(e => e.date > todayISO || (e.date === todayISO && e.time > nowTime)).sort((a,b)=>(a.date+a.time).localeCompare(b.date+b.time));
+  const nextEv = allEvs[0];
+  const fmtNext = nextEv ? (nextEv.date === todayISO ? `TODAY ${nextEv.time}` : `${new Date(nextEv.date+'T12:00').toLocaleDateString('en-GB',{weekday:'short'}).toUpperCase()} ${nextEv.time}`) : null;
+
+  return (
+    <div className="ch-w">
+      <div className="ch-m">
+        {/* Live status strip */}
+        <div className="sx" style={{ display:'flex', gap:6 }}>
+          <div className="hud hud-red glow-red" style={{ minWidth:100, padding:'8px 10px', flexShrink:0 }}>
+            <div style={{ fontFamily:'var(--mn)', fontSize:7, color:'var(--t3)', letterSpacing:'.12em', fontWeight:700 }}>MARATHON</div>
+            <div style={{ fontFamily:'var(--hd)', fontSize:26, fontWeight:600, color:'var(--gold)', lineHeight:1 }}>{dtr}</div>
+            <div style={{ fontFamily:'var(--mn)', fontSize:8, color:'var(--t3)', marginTop:2 }}>DAYS</div>
+          </div>
+          {nextEv && (
+            <div className="hud" style={{ minWidth:140, padding:'8px 10px', flexShrink:0, borderColor:'var(--bdrGold)' }}>
+              <div style={{ fontFamily:'var(--mn)', fontSize:7, color:'var(--gold)', letterSpacing:'.1em', fontWeight:700 }}>NEXT · {fmtNext}</div>
+              <div style={{ fontSize:12, marginTop:2, fontWeight:500, whiteSpace:'nowrap', overflow:'hidden', textOverflow:'ellipsis' }}>{nextEv.title}</div>
+            </div>
+          )}
+          <WeatherChip/>
+        </div>
+
+        {/* Messages */}
+        {msgs.map((m, i) => (
+          <div key={i} style={{ marginLeft:m.r==='u'?32:0, marginRight:m.r==='a'?32:0 }}>
+            <div style={{ display:'flex', alignItems:'center', gap:6, marginBottom:3 }}>
+              <span style={{ fontFamily:'var(--hd)', fontSize:10, letterSpacing:'.15em', textTransform:'uppercase', color:m.r==='u'?'var(--red)':'var(--gold)', fontWeight:700 }}>
+                {m.r==='u'?'You':'Jarvis'}
+              </span>
+              <span style={{ fontFamily:'var(--mn)', fontSize:9, color:'var(--t4)' }}>{m.ts}</span>
+            </div>
+            <div style={{ fontSize:14, lineHeight:1.6, color:m.r==='u'?'var(--t)':'var(--t2)', whiteSpace:'pre-wrap' }}>{m.t}</div>
+          </div>
+        ))}
+        {ld && <div style={{ marginRight:32 }}>
+          <span style={{ fontFamily:'var(--hd)', fontSize:10, letterSpacing:'.15em', textTransform:'uppercase', color:'var(--gold)', fontWeight:700 }}>Jarvis</span>
+          <div className="dp" style={{ marginTop:5 }}><span/><span/><span/></div>
+        </div>}
+        <div ref={er}/>
+      </div>
+
+      <div className="ch-i">
+        <div className="pls sx">
+          {['Dinner tonight 20:00', 'Middle East news', 'Add doctor Tuesday 10am', 'Log: interesting idea...'].map((p,i) => (
+            <button key={i} className="pl" onClick={()=>setInp(p)}>{p}</button>
+          ))}
+        </div>
+        <div className="cf">
+          <input value={inp} onChange={e=>setInp(e.target.value)} onKeyDown={e=>e.key==='Enter'&&send()} placeholder="Talk to Jarvis…"/>
+          <button className="sb" onClick={send} disabled={!inp.trim()||ld}>
+            <ISend size={16} color={inp.trim()&&!ld?'var(--gold)':'var(--t4)'} sw={1.75}/>
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function WeatherChip() {
+  const [w, setW] = useState(null);
+  useEffect(() => { fetchWeather().then(setW); const iv = setInterval(()=>fetchWeather().then(setW), 30*60000); return () => clearInterval(iv); }, []);
+  if (!w) return null;
+  return (
+    <div className="hud" style={{ minWidth:80, padding:'8px 10px', flexShrink:0 }}>
+      <div style={{ fontFamily:'var(--mn)', fontSize:7, color:'var(--t3)', letterSpacing:'.1em', fontWeight:700 }}>GENEVA</div>
+      <div style={{ fontFamily:'var(--hd)', fontSize:22, fontWeight:300 }}>{w.temp}°</div>
+      <div style={{ fontFamily:'var(--mn)', fontSize:8, color:'var(--t3)', marginTop:1, whiteSpace:'nowrap', overflow:'hidden', textOverflow:'ellipsis' }}>{w.desc}</div>
+    </div>
+  );
+}
+
+// ─── Brief Tab ──────────────────────────────────────────────────
+function BriefTab({ gr, dtr, gEvents, gToken }) {
+  const [w, setW] = useState(null);
+  const [fx, setFx] = useState(null);
+  const [prices, setPrices] = useState(loadPriceCache());
+
+  useEffect(() => { fetchWeather().then(setW); }, []);
+  useEffect(() => { fetchFX().then(setFx); }, []);
+
+  useEffect(() => {
+    const key = sto.get('j_ak');
+    if (!key) return;
+    const pf = loadPortfolio();
+    pf.slice(0, 4).forEach(p => {
+      if (p.symbol) fetchPrice(p.symbol, key).then(() => setPrices(loadPriceCache()));
+    });
+  }, []);
+
+  const today = new Date().toISOString().slice(0,10);
+  const todayEvs = [...loadEvents(), ...gEvents].filter(e => e.date === today).sort((a,b)=>a.time.localeCompare(b.time));
+  const pf = loadPortfolio();
+
+  return (
+    <div style={{ padding:'18px 14px' }} className="fade">
+      <div style={{ marginBottom:18 }}>
+        <div style={{ fontFamily:'var(--hd)', fontSize:28, fontWeight:400 }}>
+          <span style={{ color:'var(--t2)' }}>{gr},</span> <span style={{ color:'var(--gold)' }}>Sir.</span>
+        </div>
+        <div style={{ fontFamily:'var(--mn)', fontSize:9, color:'var(--t3)', letterSpacing:'.12em', marginTop:4, fontWeight:500 }}>ALL SYSTEMS NOMINAL · LIVE BRIEFING</div>
+      </div>
+
+      {/* Weather */}
+      <div className="hud hud-red-bdr scan glow-red" style={{ padding:16, marginBottom:12 }}>
+        <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-start' }}>
+          <div>
+            <div style={{ fontFamily:'var(--mn)', fontSize:9, color:'var(--gold)', letterSpacing:'.12em', fontWeight:700 }}>GENEVA · LIVE</div>
+            <div style={{ fontFamily:'var(--hd)', fontSize:42, fontWeight:300, lineHeight:1, marginTop:4 }}>{w?`${w.temp}°`:'--°'}</div>
+            <div style={{ fontSize:12, color:'var(--t2)', marginTop:3 }}>{w?`${w.desc} · feels ${w.feels}°`:'Loading…'}</div>
+            {w && w.rainProb > 30 && <div style={{ fontFamily:'var(--mn)', fontSize:10, color:'var(--redHot)', marginTop:3 }}>Rain probability: {w.rainProb}%</div>}
+          </div>
+          {w && (w.temp > 20 ? <ISun size={32} color="var(--gold)" sw={1.5}/> : <ICloud size={32} color="var(--t2)" sw={1.5}/>)}
+        </div>
+        <div style={{ display:'flex', alignItems:'center', gap:6, marginTop:12, paddingTop:10, borderTop:'1px solid var(--bdr)', fontSize:11, color:'var(--t3)' }}>
+          <IPin size={11} color="var(--t3)" sw={1.5}/> Massongy → Chêne-Bougerie · ~47 min standard
+        </div>
+      </div>
+
+      {/* Today schedule */}
+      <div style={{ fontFamily:'var(--hd)', fontSize:12, fontWeight:700, letterSpacing:'.14em', textTransform:'uppercase', color:'var(--red)', marginBottom:7, display:'flex', justifyContent:'space-between', alignItems:'center' }}>
+        <span>Today's Schedule</span>
+        <span style={{ fontFamily:'var(--mn)', fontSize:9, color:'var(--t3)', fontWeight:400 }}>{todayEvs.length} ITEMS</span>
+      </div>
+      <div style={{ display:'flex', flexDirection:'column', gap:4, marginBottom:16 }}>
+        {todayEvs.length === 0 ? (
+          <div className="hud" style={{ padding:'12px 14px', fontSize:11, color:'var(--t4)', textAlign:'center' }}>
+            {gToken ? 'No events today' : 'Connect Google Calendar or add via chat'}
+          </div>
+        ) : todayEvs.map((e, i) => (
+          <div key={i} className="hud" style={{ padding:'9px 11px', display:'flex', alignItems:'center', gap:9 }}>
+            <div style={{ width:3, height:22, borderRadius:2, background:e.src==='google'?'var(--gn)':'var(--gold)', flexShrink:0 }}/>
+            <span style={{ fontFamily:'var(--mn)', fontSize:11, color:'var(--t3)', width:38, flexShrink:0, fontWeight:500 }}>{e.time==='00:00'?'──':e.time}</span>
+            <div style={{ flex:1, minWidth:0 }}>
+              <div style={{ fontSize:13, whiteSpace:'nowrap', overflow:'hidden', textOverflow:'ellipsis', fontWeight:500 }}>{e.title}</div>
+              {e.notes && <div style={{ fontFamily:'var(--mn)', fontSize:9, color:'var(--t3)', marginTop:1 }}>{e.notes}</div>}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {/* Markets - live prices */}
+      <div style={{ fontFamily:'var(--hd)', fontSize:12, fontWeight:700, letterSpacing:'.14em', textTransform:'uppercase', color:'var(--gold)', marginBottom:7, display:'flex', alignItems:'center', gap:6 }}>
+        Markets <span style={{ width:5, height:5, borderRadius:'50%', background:'var(--gn)', display:'inline-block', boxShadow:'0 0 6px var(--gn)', animation:'pg 2s infinite' }}/>
+      </div>
+      <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:6, marginBottom:8 }}>
+        {pf.slice(0,4).map((p, i) => {
+          const pr = prices[p.symbol];
+          const up = pr && pr.change >= 0;
+          return (
+            <div key={i} className="hud" style={{ padding:10 }}>
+              <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center' }}>
+                <span style={{ fontFamily:'var(--mn)', fontSize:9, color:'var(--t3)', fontWeight:700 }}>{p.symbol.split('.')[0]}</span>
+                {pr && (up ? <IUp size={10} color="var(--gn)"/> : <IDn size={10} color="var(--redHot)"/>)}
+              </div>
+              <div style={{ fontFamily:'var(--mn)', fontSize:14, marginTop:3, fontWeight:500 }}>
+                {pr ? pr.price.toFixed(2) : '...'}
+              </div>
+              <div style={{ fontFamily:'var(--mn)', fontSize:10, color:pr?(up?'var(--gn)':'var(--redHot)'):'var(--t4)', fontWeight:500 }}>
+                {pr ? `${up?'+':''}${pr.changePct.toFixed(2)}%` : '──'}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      {/* FX */}
+      <div className="hud" style={{ padding:'9px 12px', display:'flex', justifyContent:'space-around', marginBottom:16 }}>
+        {fx ? [
+          { p:'CHF/EUR', r:fx.chfEur.toFixed(4) },
+          { p:'CHF/USD', r:fx.chfUsd.toFixed(4) },
+          { p:'USD/EUR', r:fx.usdEur.toFixed(4) },
+        ].map((f, i) => (
+          <div key={i} style={{ textAlign:'center' }}>
+            <div style={{ fontFamily:'var(--mn)', fontSize:8, color:'var(--t3)', fontWeight:700 }}>{f.p}</div>
+            <div style={{ fontFamily:'var(--mn)', fontSize:13, marginTop:2, color:'var(--gold)' }}>{f.r}</div>
+          </div>
+        )) : <div style={{ fontFamily:'var(--mn)', fontSize:10, color:'var(--t4)' }}>Loading FX…</div>}
+      </div>
+
+      {/* Quick actions */}
+      <div style={{ fontFamily:'var(--hd)', fontSize:12, fontWeight:700, letterSpacing:'.14em', textTransform:'uppercase', color:'var(--red)', marginBottom:7 }}>
+        Ask Jarvis
+      </div>
+      <div className="hud hud-red-bdr" style={{ padding:'14px 16px' }}>
+        <div style={{ fontSize:12, color:'var(--t2)', lineHeight:1.6 }}>
+          Switch to <span style={{ color:'var(--gold)', fontWeight:600 }}>Chat</span> tab and ask anything:
+        </div>
+        <div style={{ display:'flex', flexDirection:'column', gap:6, marginTop:10 }}>
+          <div style={{ fontFamily:'var(--mn)', fontSize:11, color:'var(--gold)' }}>"What's happening in the Middle East?"</div>
+          <div style={{ fontFamily:'var(--mn)', fontSize:11, color:'var(--gold)' }}>"Latest market news?"</div>
+          <div style={{ fontFamily:'var(--mn)', fontSize:11, color:'var(--gold)' }}>"Dinner with Mélanie tonight at 20:00"</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Finance Tab ────────────────────────────────────────────────
+function FinTab() {
+  const [pf, setPf] = useState(loadPortfolio());
+  const [prices, setPrices] = useState(loadPriceCache());
+  const [fx, setFx] = useState(null);
+  const [editing, setEditing] = useState(null);
+  const [adding, setAdding] = useState(false);
+  const [loading, setLoading] = useState(false);
+
+  const refresh = async () => {
+    const key = sto.get('j_ak');
+    if (!key) return;
+    setLoading(true);
+    // Sequential to avoid burning free quota
+    for (const p of pf) {
+      if (p.symbol) await fetchPrice(p.symbol, key);
+    }
+    setPrices(loadPriceCache());
+    setLoading(false);
+  };
+
+  useEffect(() => { refresh(); fetchFX().then(setFx); }, []);
+
+  const saveHolding = (h) => {
+    const newPf = h.id ? pf.map(x => x.id === h.id ? h : x) : [...pf, { ...h, id: Date.now() }];
+    setPf(newPf); savePortfolio(newPf); setEditing(null); setAdding(false);
+  };
+  const delHolding = (id) => {
+    const newPf = pf.filter(x => x.id !== id);
+    setPf(newPf); savePortfolio(newPf); setEditing(null);
+  };
+
+  // Calculate totals using live prices where available
+  const lines = pf.map(p => {
+    const pr = prices[p.symbol];
+    const value = pr ? p.units * pr.price : p.units * p.costBasis;
+    const cost = p.units * p.costBasis;
+    const gain = value - cost;
+    const gainPct = cost > 0 ? (gain / cost * 100) : 0;
+    return { ...p, live: !!pr, price: pr?.price || p.costBasis, value, cost, gain, gainPct };
+  });
+  const totalVal = lines.reduce((s, x) => s + x.value, 0);
+  const totalCost = lines.reduce((s, x) => s + x.cost, 0);
+  const totalGain = totalVal - totalCost;
+  const totalPct = totalCost > 0 ? (totalGain / totalCost * 100) : 0;
+  const maxVal = Math.max(...lines.map(l => l.value), 1);
+
+  const hasKey = !!sto.get('j_ak');
+
+  return (
+    <div style={{ padding:'18px 14px' }} className="fade">
+      <div style={{ marginBottom:16, display:'flex', justifyContent:'space-between', alignItems:'flex-start' }}>
+        <div>
+          <div style={{ fontFamily:'var(--mn)', fontSize:9, color:'var(--t3)', letterSpacing:'.12em', fontWeight:700 }}>PORTFOLIO VALUE</div>
+          <div style={{ fontFamily:'var(--hd)', fontSize:36, fontWeight:400, marginTop:4, background:'linear-gradient(135deg, var(--gold), var(--red))', WebkitBackgroundClip:'text', WebkitTextFillColor:'transparent', backgroundClip:'text' }}>
+            €{totalVal.toLocaleString('fr-FR', { maximumFractionDigits:0 })}
+          </div>
+          {totalCost > 0 && (
+            <div style={{ display:'flex', alignItems:'center', gap:8, marginTop:4 }}>
+              <span style={{ fontFamily:'var(--mn)', fontSize:12, color:totalGain>=0?'var(--gn)':'var(--redHot)', fontWeight:500 }}>
+                {totalGain>=0?'+':''}€{totalGain.toLocaleString('fr-FR', { maximumFractionDigits:0 })}
+              </span>
+              <span style={{ fontFamily:'var(--mn)', fontSize:10, color:totalGain>=0?'var(--gn)':'var(--redHot)' }}>
+                {totalGain>=0?'+':''}{totalPct.toFixed(1)}%
+              </span>
+            </div>
+          )}
+        </div>
+        <button onClick={refresh} disabled={loading || !hasKey} style={{ background:'var(--bg3)', border:'1px solid var(--bdrGold)', borderRadius:8, width:36, height:36, cursor:'pointer', display:'flex', alignItems:'center', justifyContent:'center' }}>
+          <IRefresh size={15} color={loading?'var(--t4)':'var(--gold)'} sw={2}/>
+        </button>
+      </div>
+
+      {!hasKey && (
+        <div className="hud hud-red-bdr" style={{ padding:12, marginBottom:14 }}>
+          <div style={{ fontFamily:'var(--mn)', fontSize:9, color:'var(--redHot)', fontWeight:700, letterSpacing:'.1em' }}>NO PRICE FEED</div>
+          <div style={{ fontSize:11, color:'var(--t2)', marginTop:4 }}>Add Alpha Vantage key in ⚙️ to enable live prices.</div>
+        </div>
+      )}
+
+      {/* Holdings */}
+      <div style={{ fontFamily:'var(--hd)', fontSize:12, fontWeight:700, letterSpacing:'.14em', textTransform:'uppercase', color:'var(--gold)', marginBottom:8, display:'flex', justifyContent:'space-between', alignItems:'center' }}>
+        <span>Holdings</span>
+        <button onClick={()=>setAdding(true)} style={{ background:'none', border:'1px solid var(--bdrGold)', borderRadius:6, padding:'4px 8px', cursor:'pointer', display:'flex', alignItems:'center', gap:3, fontFamily:'var(--hd)', fontSize:10, color:'var(--gold)', fontWeight:600, letterSpacing:'.08em' }}>
+          <IPlus size={10} color="var(--gold)" sw={2.5}/> ADD
+        </button>
+      </div>
+
+      {(adding || editing) && (
+        <HoldingForm holding={editing} onSave={saveHolding} onCancel={()=>{setEditing(null); setAdding(false);}} onDelete={editing ? ()=>delHolding(editing.id) : null}/>
+      )}
+
+      {pf.length === 0 ? (
+        <div className="hud" style={{ padding:14, textAlign:'center', marginBottom:14 }}>
+          <div style={{ fontSize:12, color:'var(--t3)' }}>No holdings yet. Tap ADD to create one.</div>
+        </div>
+      ) : (
+        <div style={{ display:'flex', flexDirection:'column', gap:5, marginBottom:16 }}>
+          {lines.map((x, i) => (
+            <div key={i} onClick={()=>setEditing(x)} className="hud" style={{ padding:'10px 12px', cursor:'pointer' }}>
+              <div style={{ display:'flex', justifyContent:'space-between' }}>
+                <div style={{ flex:1, minWidth:0 }}>
+                  <div style={{ fontSize:13, fontWeight:500 }}>{x.name}</div>
+                  <div style={{ fontFamily:'var(--mn)', fontSize:9, color:'var(--t3)', marginTop:2 }}>
+                    {x.symbol} · {x.units} units {x.live && <span style={{ color:'var(--gn)' }}>· LIVE</span>}
+                  </div>
+                </div>
+                <div style={{ textAlign:'right' }}>
+                  <div style={{ fontFamily:'var(--mn)', fontSize:13, fontWeight:500 }}>€{x.value.toLocaleString('fr-FR', { maximumFractionDigits:0 })}</div>
+                  {x.cost > 0 && (
+                    <div style={{ fontFamily:'var(--mn)', fontSize:10, color:x.gain>=0?'var(--gn)':'var(--redHot)' }}>
+                      {x.gain>=0?'+':''}{x.gainPct.toFixed(1)}%
+                    </div>
+                  )}
+                </div>
+              </div>
+              <div className="bf" style={{ marginTop:6 }}><div className="bff" style={{ width:`${(x.value/maxVal)*100}%` }}/></div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* FX */}
+      <div style={{ fontFamily:'var(--hd)', fontSize:12, fontWeight:700, letterSpacing:'.14em', textTransform:'uppercase', color:'var(--red)', marginBottom:8 }}>Live FX</div>
+      <div className="hud" style={{ padding:0, overflow:'hidden' }}>
+        {fx ? [
+          { p:'CHF / EUR', r:fx.chfEur, note:'Salary conversion' },
+          { p:'CHF / USD', r:fx.chfUsd, note:'Dollar holdings' },
+          { p:'USD / EUR', r:fx.usdEur, note:'SPY exposure' },
+        ].map((f, i, a) => (
+          <div key={i} style={{ display:'flex', justifyContent:'space-between', alignItems:'center', padding:'11px 14px', borderBottom:i<a.length-1?'1px solid var(--bdr)':'none' }}>
+            <div>
+              <div style={{ fontSize:13, fontWeight:500 }}>{f.p}</div>
+              <div style={{ fontFamily:'var(--mn)', fontSize:9, color:'var(--t4)' }}>{f.note}</div>
+            </div>
+            <div style={{ fontFamily:'var(--mn)', fontSize:14, color:'var(--gold)', fontWeight:500 }}>{f.r.toFixed(4)}</div>
+          </div>
+        )) : <div style={{ padding:14, fontFamily:'var(--mn)', fontSize:10, color:'var(--t4)' }}>Loading FX rates…</div>}
+      </div>
+    </div>
+  );
+}
+
+function HoldingForm({ holding, onSave, onCancel, onDelete }) {
+  const [name, setName] = useState(holding?.name || '');
+  const [symbol, setSymbol] = useState(holding?.symbol || '');
+  const [units, setUnits] = useState(holding?.units || '');
+  const [cost, setCost] = useState(holding?.costBasis || '');
+
+  const save = () => {
+    if (!name.trim() || !symbol.trim()) return;
+    onSave({
+      id: holding?.id,
+      name: name.trim(),
+      symbol: symbol.trim().toUpperCase(),
+      units: parseFloat(units) || 0,
+      costBasis: parseFloat(cost) || 0
+    });
+  };
+
+  return (
+    <div className="hud hud-gold-bdr glow-gold" style={{ padding:14, marginBottom:12 }}>
+      <div style={{ fontFamily:'var(--hd)', fontSize:11, fontWeight:700, color:'var(--gold)', letterSpacing:'.12em', marginBottom:10 }}>
+        {holding ? 'EDIT HOLDING' : 'NEW HOLDING'}
+      </div>
+      <div style={{ display:'flex', flexDirection:'column', gap:6 }}>
+        <input className="ipt" value={name} onChange={e=>setName(e.target.value)} placeholder="Name (e.g. Accenture)"/>
+        <input className="ipt" value={symbol} onChange={e=>setSymbol(e.target.value)} placeholder="Symbol (e.g. ACN)"/>
+        <div style={{ display:'flex', gap:6 }}>
+          <input className="ipt" value={units} onChange={e=>setUnits(e.target.value)} placeholder="Units" type="number" step="any"/>
+          <input className="ipt" value={cost} onChange={e=>setCost(e.target.value)} placeholder="Avg cost" type="number" step="any"/>
+        </div>
+      </div>
+      <div style={{ display:'flex', gap:6, marginTop:10 }}>
+        <button onClick={save} style={{ flex:1, padding:10, background:'linear-gradient(135deg, var(--gold), var(--red))', border:'none', borderRadius:8, color:'#fff', fontFamily:'var(--hd)', fontSize:12, fontWeight:700, letterSpacing:'.1em', cursor:'pointer' }}>SAVE</button>
+        <button onClick={onCancel} style={{ padding:'10px 14px', background:'var(--bg3)', border:'1px solid var(--bdr)', borderRadius:8, color:'var(--t2)', fontFamily:'var(--hd)', fontSize:12, fontWeight:600, letterSpacing:'.1em', cursor:'pointer' }}>CANCEL</button>
+        {onDelete && <button onClick={onDelete} style={{ padding:'10px 12px', background:'rgba(230,57,70,0.1)', border:'1px solid var(--bdr2)', borderRadius:8, cursor:'pointer', display:'flex', alignItems:'center' }}><ITrash size={13} color="var(--redHot)" sw={2}/></button>}
+      </div>
+    </div>
+  );
+}
+
+// ─── Calendar Tab ───────────────────────────────────────────────
+function CalTab({ gToken, gEvents }) {
+  const [localEvs, setLocalEvs] = useState(loadEvents());
+  useEffect(() => { const iv = setInterval(()=>setLocalEvs(loadEvents()), 2000); return ()=>clearInterval(iv); }, []);
+
+  const evs = [...localEvs, ...gEvents].sort((a,b)=>(a.date+a.time).localeCompare(b.date+b.time));
+  const today = new Date().toISOString().slice(0,10);
+
+  const grouped = {};
+  evs.forEach(e => { if (!grouped[e.date]) grouped[e.date]=[]; grouped[e.date].push(e); });
+  const dates = Object.keys(grouped).sort();
+
+  const fmtDate = (iso) => {
+    if (iso === today) return 'TODAY · ' + new Date(iso+'T12:00').toLocaleDateString('en-GB',{weekday:'short',day:'numeric',month:'short'}).toUpperCase();
+    return new Date(iso+'T12:00').toLocaleDateString('en-GB',{weekday:'short',day:'numeric',month:'short'}).toUpperCase();
+  };
+
+  const removeEv = (id) => {
+    if (typeof id === 'string' && id.startsWith('g_')) return; // can't delete Google events
+    deleteEvent(id); setLocalEvs(loadEvents());
+  };
+
+  return (
+    <div style={{ padding:'18px 14px' }} className="fade">
+      <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-start', marginBottom:14 }}>
+        <div>
+          <div style={{ fontFamily:'var(--hd)', fontSize:26, fontWeight:400 }}>
+            <span style={{ color:'var(--t2)' }}>Calendar</span>
+          </div>
+          <div style={{ fontFamily:'var(--mn)', fontSize:9, color:'var(--t3)', letterSpacing:'.12em', marginTop:3 }}>NEXT 14 DAYS · {evs.length} EVENTS</div>
+        </div>
+        <div style={{ fontFamily:'var(--mn)', fontSize:8, color:gToken?'var(--gn)':'var(--t4)', display:'flex', alignItems:'center', gap:3, fontWeight:700, marginTop:8 }}>
+          <span style={{ width:5, height:5, borderRadius:'50%', background:gToken?'var(--gn)':'var(--t4)', boxShadow:gToken?'0 0 4px var(--gn)':'none' }}/>
+          {gToken ? 'LIVE SYNC' : 'LOCAL ONLY'}
+        </div>
+      </div>
+
+      <div style={{ display:'flex', gap:5, marginBottom:14 }}>
+        <div style={{ display:'flex', alignItems:'center', gap:5, padding:'4px 9px', border:'1px solid var(--bdrGold)', borderRadius:5, fontSize:9, fontFamily:'var(--mn)', color:'var(--gold)', fontWeight:600 }}>
+          <span style={{ width:5, height:5, borderRadius:'50%', background:'var(--gold)' }}/>Jarvis ({localEvs.length})
+        </div>
+        <div style={{ display:'flex', alignItems:'center', gap:5, padding:'4px 9px', border:'1px solid rgba(34,197,94,0.3)', borderRadius:5, fontSize:9, fontFamily:'var(--mn)', color:'var(--gn)', fontWeight:600 }}>
+          <span style={{ width:5, height:5, borderRadius:'50%', background:'var(--gn)' }}/>Google ({gEvents.length})
+        </div>
+      </div>
+
+      {dates.length === 0 ? (
+        <div className="hud" style={{ padding:20, textAlign:'center' }}>
+          <div style={{ fontFamily:'var(--mn)', fontSize:10, color:'var(--t3)', letterSpacing:'.12em', fontWeight:700 }}>NO EVENTS</div>
+          <div style={{ fontSize:11, color:'var(--t4)', marginTop:6 }}>Ask Jarvis to schedule something</div>
+        </div>
+      ) : (
+        <div style={{ display:'flex', flexDirection:'column', gap:14 }}>
+          {dates.map((date, i) => (
+            <div key={i}>
+              <div style={{ fontFamily:'var(--mn)', fontSize:9, color:date===today?'var(--gold)':'var(--t3)', letterSpacing:'.12em', marginBottom:6, fontWeight:700 }}>{fmtDate(date)}</div>
+              <div style={{ display:'flex', flexDirection:'column', gap:3 }}>
+                {grouped[date].map((e, j) => (
+                  <div key={j} className="hud" style={{ padding:'9px 10px', display:'flex', alignItems:'center', gap:8 }}>
+                    <div style={{ width:3, height:22, borderRadius:2, background:e.src==='google'?'var(--gn)':'var(--gold)', flexShrink:0 }}/>
+                    <span style={{ fontFamily:'var(--mn)', fontSize:10, color:'var(--t3)', width:36, flexShrink:0, fontWeight:500 }}>{e.time==='00:00'?'──':e.time}</span>
+                    <div style={{ flex:1, minWidth:0 }}>
+                      <div style={{ fontSize:12, whiteSpace:'nowrap', overflow:'hidden', textOverflow:'ellipsis', fontWeight:500 }}>{e.title}</div>
+                      {e.notes && <div style={{ fontFamily:'var(--mn)', fontSize:9, color:'var(--t4)', marginTop:1, whiteSpace:'nowrap', overflow:'hidden', textOverflow:'ellipsis' }}>{e.notes}</div>}
+                    </div>
+                    {e.src !== 'google' && (
+                      <button onClick={()=>removeEv(e.id)} style={{ background:'none', border:'none', cursor:'pointer', padding:4, display:'flex' }}>
+                        <ITrash size={11} color="var(--t4)" sw={1.75}/>
+                      </button>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Brain Tab ──────────────────────────────────────────────────
+function BrainTab() {
+  const [items, setItems] = useState(loadBrain());
+  const [filter, setFilter] = useState('all');
+  const [search, setSearch] = useState('');
+  useEffect(() => { const iv = setInterval(()=>setItems(loadBrain()), 2000); return ()=>clearInterval(iv); }, []);
+
+  const allTags = [...new Set(items.flatMap(i => i.tags || []))].map(t => t.toLowerCase()).filter(Boolean);
+  const tags = ['all', ...allTags.slice(0, 8)];
+  const vis = items.filter(x => {
+    const matchTag = filter === 'all' || (x.tags || []).some(t => t.toLowerCase() === filter);
+    const matchSearch = !search || x.title.toLowerCase().includes(search.toLowerCase()) || (x.comment||'').toLowerCase().includes(search.toLowerCase());
+    return matchTag && matchSearch;
+  });
+
+  const remove = (id) => { deleteBrainItem(id); setItems(loadBrain()); };
+  const ago = (iso) => {
+    const d = (Date.now() - new Date(iso).getTime()) / 60000;
+    if (d < 60) return Math.round(d) + 'm';
+    if (d < 1440) return Math.round(d/60) + 'h';
+    return Math.round(d/1440) + 'd';
+  };
+
+  return (
+    <div style={{ padding:'18px 14px' }} className="fade">
+      <div style={{ marginBottom:14 }}>
+        <div style={{ fontFamily:'var(--hd)', fontSize:26, fontWeight:400 }}>
+          <span style={{ color:'var(--t2)' }}>Second</span> <span style={{ color:'var(--gold)' }}>Brain</span>
+        </div>
+        <div style={{ fontFamily:'var(--mn)', fontSize:9, color:'var(--t3)', letterSpacing:'.12em', marginTop:3, fontWeight:500 }}>MEMORY ARCHIVE · {items.length} ENTRIES</div>
+      </div>
+
+      {items.length > 0 && (
+        <input className="ipt" value={search} onChange={e=>setSearch(e.target.value)} placeholder="Search notes…" style={{ marginBottom:10, fontFamily:'var(--bd)', fontSize:13, padding:'10px 12px' }}/>
+      )}
+
+      {allTags.length > 0 && (
+        <div className="sx" style={{ display:'flex', gap:5, paddingBottom:10 }}>
+          {tags.map((t, i) => (
+            <button key={i} onClick={()=>setFilter(t)} className="pl" style={filter===t ? { borderColor:'var(--gold)', color:'var(--gold)', background:'rgba(255,180,0,0.07)' } : {}}>#{t}</button>
+          ))}
+        </div>
+      )}
+
+      {items.length === 0 ? (
+        <div className="hud hud-gold-bdr" style={{ padding:'18px 16px', textAlign:'center' }}>
+          <div style={{ fontFamily:'var(--mn)', fontSize:10, color:'var(--gold)', letterSpacing:'.12em', fontWeight:700 }}>EMPTY ARCHIVE</div>
+          <div style={{ fontSize:12, color:'var(--t2)', marginTop:8, lineHeight:1.5 }}>Tell Jarvis to remember things:</div>
+          <div style={{ fontFamily:'var(--mn)', fontSize:11, color:'var(--t3)', marginTop:6, lineHeight:1.6 }}>
+            "Log: saw great article on AI"<br/>
+            "Remember: Christian suggested X"<br/>
+            "Note: try fasted runs"
+          </div>
+        </div>
+      ) : (
+        <div style={{ display:'flex', flexDirection:'column', gap:6 }}>
+          {vis.map((x, i) => (
+            <div key={i} className="hud" style={{ padding:'10px 12px' }}>
+              <div style={{ display:'flex', gap:8, alignItems:'flex-start' }}>
+                <div style={{ width:28, height:28, borderRadius:6, background:'rgba(255,180,0,0.08)', border:'1px solid var(--bdr)', display:'flex', alignItems:'center', justifyContent:'center', flexShrink:0 }}>
+                  <IHash size={12} color="var(--gold)" sw={1.75}/>
+                </div>
+                <div style={{ flex:1, minWidth:0 }}>
+                  <div style={{ fontSize:12, lineHeight:1.4, fontWeight:500 }}>{x.title}</div>
+                  <div style={{ fontFamily:'var(--mn)', fontSize:9, color:'var(--t3)', marginTop:2 }}>{ago(x.ts)} ago</div>
+                  {x.comment && <div style={{ fontSize:11, color:'var(--t2)', fontStyle:'italic', marginTop:6, borderLeft:'2px solid var(--bdrGold)', paddingLeft:8 }}>{x.comment}</div>}
+                  {x.tags?.length > 0 && (
+                    <div style={{ display:'flex', gap:3, marginTop:6, flexWrap:'wrap' }}>
+                      {x.tags.map((t, j) => <span key={j} className="tag">{t.toLowerCase()}</span>)}
+                    </div>
+                  )}
+                </div>
+                <button onClick={()=>remove(x.id)} style={{ background:'none', border:'none', cursor:'pointer', padding:4, display:'flex' }}>
+                  <ITrash size={11} color="var(--t4)" sw={1.75}/>
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Marathon Tab ───────────────────────────────────────────────
+function RunTab({ days, gEvents, gToken }) {
+  const keywords = ['run','running','km','tempo','easy','long run','interval','trail','garmin','training','jog','course','sortie','cardio'];
+  const runs = gEvents.filter(e => keywords.some(k => e.title.toLowerCase().includes(k)));
+
+  const today = new Date();
+  const todayStr = today.toISOString().slice(0,10);
+  const monday = new Date(today); monday.setDate(today.getDate() - ((today.getDay()+6)%7));
+  const weekDays = Array.from({length:7}, (_,i) => { const d=new Date(monday); d.setDate(monday.getDate()+i); return d.toISOString().slice(0,10); });
+  const dayLabels = ['M','T','W','T','F','S','S'];
+
+  const upcomingRuns = runs.filter(e => e.date >= todayStr).slice(0, 5);
+  const nextRun = upcomingRuns[0];
+
+  const fmtDate = (iso) => new Date(iso+'T12:00').toLocaleDateString('en-GB',{weekday:'short',day:'numeric',month:'short'}).toUpperCase();
+
+  return (
+    <div style={{ padding:'18px 14px' }} className="fade">
+      {/* Countdown hero */}
+      <div className="hud hud-red-bdr scan glow-red" style={{ padding:20, marginBottom:14, position:'relative', overflow:'hidden' }}>
+        <div style={{ position:'absolute', top:-30, right:-30, width:130, height:130, background:'var(--red)', opacity:0.06, filter:'blur(50px)', borderRadius:'50%' }}/>
+        <div style={{ fontFamily:'var(--mn)', fontSize:9, color:'var(--gold)', letterSpacing:'.14em', marginBottom:6, fontWeight:700 }}>LAKE MAGGIORE · NOVEMBER 8</div>
+        <div style={{ display:'flex', alignItems:'baseline', gap:10 }}>
+          <span style={{ fontFamily:'var(--hd)', fontSize:62, fontWeight:400, lineHeight:1, background:'linear-gradient(135deg, var(--gold), var(--red))', WebkitBackgroundClip:'text', WebkitTextFillColor:'transparent', backgroundClip:'text' }}>{days}</span>
+          <span style={{ fontFamily:'var(--hd)', fontSize:20, fontWeight:300, color:'var(--t3)' }}>days</span>
+        </div>
+        <div style={{ fontSize:11, color:'var(--t2)', marginTop:8 }}>{Math.floor(days/7)} weeks · {(days%7)} days remaining</div>
+      </div>
+
+      {/* Week at a glance */}
+      <div style={{ fontFamily:'var(--hd)', fontSize:12, fontWeight:700, letterSpacing:'.14em', textTransform:'uppercase', color:'var(--gold)', marginBottom:7, display:'flex', justifyContent:'space-between', alignItems:'center' }}>
+        <span>This Week</span>
+        <span style={{ fontFamily:'var(--mn)', fontSize:9, color:gToken?'var(--gn)':'var(--t4)', fontWeight:500 }}>
+          {gToken ? 'GARMIN SYNCED' : 'CONNECT GOOGLE'}
+        </span>
+      </div>
+      <div style={{ display:'grid', gridTemplateColumns:'repeat(7,1fr)', gap:4, marginBottom:16 }}>
+        {weekDays.map((date, i) => {
+          const hasRun = runs.some(e => e.date === date);
+          const isToday = date === todayStr;
+          const isPast = date < todayStr;
+          return (
+            <div key={i} className={`wk${isToday?' td':''}${isPast && hasRun ?' dn':''}`}>
+              <div style={{ fontFamily:'var(--mn)', fontSize:8, color:'var(--t4)', textTransform:'uppercase', fontWeight:700 }}>{dayLabels[i]}</div>
+              <div style={{ fontSize:10, marginTop:3, color:isToday?'var(--gold)':(isPast && hasRun)?'var(--gn)':hasRun?'var(--t2)':'var(--t4)', fontWeight:500 }}>
+                {hasRun ? 'Run' : '──'}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Upcoming sessions */}
+      <div style={{ fontFamily:'var(--hd)', fontSize:12, fontWeight:700, letterSpacing:'.14em', textTransform:'uppercase', color:'var(--red)', marginBottom:7 }}>Upcoming Sessions</div>
+      {!gToken ? (
+        <div className="hud" style={{ padding:14 }}>
+          <div style={{ fontSize:12, color:'var(--t3)' }}>Connect Google Calendar to see your Garmin training plan.</div>
+          <div style={{ fontFamily:'var(--mn)', fontSize:10, color:'var(--gold)', marginTop:6 }}>Tap ⚙️ → Sign in with Google</div>
+        </div>
+      ) : upcomingRuns.length === 0 ? (
+        <div className="hud" style={{ padding:14 }}>
+          <div style={{ fontSize:12, color:'var(--t3)' }}>No upcoming runs scheduled.</div>
+          <div style={{ fontFamily:'var(--mn)', fontSize:10, color:'var(--t4)', marginTop:4 }}>Ensure Garmin Connect → Google Calendar sync is active.</div>
+        </div>
+      ) : (
+        <div style={{ display:'flex', flexDirection:'column', gap:5, marginBottom:14 }}>
+          {upcomingRuns.map((r, i) => (
+            <div key={i} className="hud" style={{ padding:'10px 12px', display:'flex', alignItems:'center', gap:9 }}>
+              <div style={{ width:3, height:22, borderRadius:2, background:'var(--gn)', flexShrink:0 }}/>
+              <div style={{ flex:1, minWidth:0 }}>
+                <div style={{ fontFamily:'var(--mn)', fontSize:9, color:'var(--t3)', fontWeight:700 }}>
+                  {fmtDate(r.date)} {r.time !== '00:00' ? '· ' + r.time : ''}
+                </div>
+                <div style={{ fontSize:12, marginTop:2, fontWeight:500 }}>{r.title}</div>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Next run highlight */}
+      {nextRun && (
+        <div className="hud hud-gold-bdr glow-gold" style={{ padding:14, marginTop:14 }}>
+          <div style={{ display:'flex', alignItems:'center', gap:6, marginBottom:5 }}>
+            <IFlame size={12} color="var(--gold)" sw={1.75}/>
+            <span style={{ fontFamily:'var(--mn)', fontSize:9, letterSpacing:'.12em', color:'var(--gold)', fontWeight:700 }}>NEXT RUN</span>
+          </div>
+          <div style={{ fontFamily:'var(--hd)', fontSize:18, fontWeight:500 }}>{nextRun.title}</div>
+          <div style={{ fontSize:11, color:'var(--t2)', marginTop:3 }}>
+            {new Date(nextRun.date+'T12:00').toLocaleDateString('en-GB',{weekday:'long',day:'numeric',month:'long'})}
+            {nextRun.time !== '00:00' ? ' · ' + nextRun.time : ''}
+          </div>
+          {nextRun.notes && <div style={{ fontSize:11, color:'var(--t3)', marginTop:5 }}>{nextRun.notes}</div>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<Jarvis/>);
+</script>
+</body>
+</html>
