@@ -1,0 +1,64 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#1a0d10"/>
+      <stop offset="100%" stop-color="#0a0507"/>
+    </radialGradient>
+    <radialGradient id="core" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#fff6e0"/>
+      <stop offset="30%" stop-color="#ffd447"/>
+      <stop offset="70%" stop-color="#ffb400"/>
+      <stop offset="100%" stop-color="#cc8800"/>
+    </radialGradient>
+    <radialGradient id="glow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#ffb400" stop-opacity="0.8"/>
+      <stop offset="50%" stop-color="#e63946" stop-opacity="0.3"/>
+      <stop offset="100%" stop-color="#e63946" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="ring" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ffb400"/>
+      <stop offset="100%" stop-color="#e63946"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Rounded black background (maskable-safe) -->
+  <rect width="512" height="512" rx="96" fill="url(#bg)"/>
+
+  <!-- Outer glow -->
+  <circle cx="256" cy="256" r="220" fill="url(#glow)"/>
+
+  <!-- Outer ring (triangular segments, Mark III style) -->
+  <g transform="translate(256 256)">
+    <g stroke="url(#ring)" stroke-width="3" fill="none" opacity="0.9">
+      <circle r="180"/>
+      <circle r="150"/>
+    </g>
+    <!-- 8 triangular coils (simplified) -->
+    <g fill="url(#ring)" opacity="0.85">
+      <path d="M 0 -165 L 14 -140 L -14 -140 Z"/>
+      <path d="M 117 -117 L 135 -99 L 99 -135 Z"/>
+      <path d="M 165 0 L 140 14 L 140 -14 Z"/>
+      <path d="M 117 117 L 99 135 L 135 99 Z"/>
+      <path d="M 0 165 L -14 140 L 14 140 Z"/>
+      <path d="M -117 117 L -135 99 L -99 135 Z"/>
+      <path d="M -165 0 L -140 -14 L -140 14 Z"/>
+      <path d="M -117 -117 L -99 -135 L -135 -99 Z"/>
+    </g>
+  </g>
+
+  <!-- Middle ring -->
+  <circle cx="256" cy="256" r="110" fill="none" stroke="#ffb400" stroke-width="4" opacity="0.7"/>
+
+  <!-- Inner dark well -->
+  <circle cx="256" cy="256" r="90" fill="#0a0507"/>
+
+  <!-- Triangle inside (Mark III iconic triangle) -->
+  <polygon points="256,180 330,310 182,310" fill="none" stroke="url(#ring)" stroke-width="5" stroke-linejoin="round" opacity="0.9"/>
+
+  <!-- Bright core -->
+  <circle cx="256" cy="256" r="42" fill="url(#core)"/>
+  <circle cx="256" cy="256" r="22" fill="#ffffff" opacity="0.95"/>
+
+  <!-- Hot spot highlight -->
+  <circle cx="248" cy="246" r="10" fill="#ffffff" opacity="0.9"/>
+</svg>
