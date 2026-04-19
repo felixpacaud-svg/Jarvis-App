@@ -1,0 +1,45 @@
+{
+  "name": "J.A.R.V.I.S.",
+  "short_name": "Jarvis",
+  "description": "Felix's personal AI assistant — Iron Man style",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0a0507",
+  "theme_color": "#0a0507",
+  "icons": [
+    {
+      "src": "./jarvis-icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "./jarvis-icon.svg",
+      "sizes": "192x192 512x512",
+      "type": "image/svg+xml"
+    }
+  ],
+  "categories": ["productivity", "utilities", "lifestyle"],
+  "shortcuts": [
+    {
+      "name": "Chat",
+      "short_name": "Chat",
+      "url": "./?tab=chat",
+      "icons": [{ "src": "./jarvis-icon.svg", "sizes": "any" }]
+    },
+    {
+      "name": "Briefing",
+      "short_name": "Brief",
+      "url": "./?tab=home",
+      "icons": [{ "src": "./jarvis-icon.svg", "sizes": "any" }]
+    },
+    {
+      "name": "Brain",
+      "short_name": "Brain",
+      "url": "./?tab=brain",
+      "icons": [{ "src": "./jarvis-icon.svg", "sizes": "any" }]
+    }
+  ]
+}
